@@ -52,56 +52,142 @@ type netTun struct {
 
 type Net netTun
 
+// CreateNetTUN creates a new tunnel device and network stack.
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device, *Net, error) {
+	ifacePrefixes := make([]netip.Prefix, len(localAddresses))
+
+	for i := range localAddresses {
+		ifacePrefixes[i] = netip.PrefixFrom(localAddresses[i], localAddresses[i].BitLen())
+	}
+
+	return Create(Config{
+		IfaceAddrs: ifacePrefixes,
+		DNSServers: dnsServers,
+		MTU:        mtu,
+	})
+}
+
+// Config stores configuration settings for a new tunnel device
+// and network stack.
+type Config struct {
+	// IfaceAddrs are the address(es) to assign to the tunnel's
+	// virtual interface.
+	IfaceAddrs []netip.Prefix
+
+	// DNSServers are the DNS server addresses to use for
+	// the tunnel's virtual interface.
+	DNSServers []netip.Addr
+
+	// MTU is the maxiumum transmission unit (MTU) for the
+	// tunnel's virtual interface.
+	MTU int
+
+	// ForwardV4 enables IP forwarding between IPv4 peers
+	// connected to the virtual interface if set to true.
+	ForwardV4 bool
+
+	// ForwardV6 enables IP forwarding between IPv6 peers
+	// connected to the virtual interface if set to true.
+	ForwardV6 bool
+
+	// OptOptionsFn is called if non-nil. It receives the current
+	// tunnel's network stack options, allowing callers to modify
+	// or examine it prior to network stack initialization.
+	OptOptionsFn func(*stack.Options) error
+
+	// OptStackFn is called if non-nil. It receives the current
+	// tunnel's network stack, allowing callers to modify or
+	// examine it.
+	OptStackFn func(*stack.Stack) error
+}
+
+// Create creates a new tunnel device and network stack.
+func Create(config Config) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4},
 		HandleLocal:        true,
 	}
+
+	if config.OptOptionsFn != nil {
+		err := config.OptOptionsFn(&opts)
+		if err != nil {
+			return nil, nil, fmt.Errorf("optional netstack options function failed: %w", err)
+		}
+	}
+
 	dev := &netTun{
-		ep:             channel.New(1024, uint32(mtu), ""),
+		ep:             channel.New(1024, uint32(config.MTU), ""),
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
 		incomingPacket: make(chan *buffer.View),
-		dnsServers:     dnsServers,
-		mtu:            mtu,
+		dnsServers:     config.DNSServers,
+		mtu:            config.MTU,
 	}
+
 	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
 	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
 	}
+
 	dev.notifyHandle = dev.ep.AddNotify(dev)
+
 	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
 	if tcpipErr != nil {
 		return nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
-	for _, ip := range localAddresses {
+
+	for _, prefix := range config.IfaceAddrs {
+		ip := prefix.Addr()
 		var protoNumber tcpip.NetworkProtocolNumber
 		if ip.Is4() {
 			protoNumber = ipv4.ProtocolNumber
+			dev.hasV4 = true
 		} else if ip.Is6() {
 			protoNumber = ipv6.ProtocolNumber
+			dev.hasV6 = true
 		}
 		protoAddr := tcpip.ProtocolAddress{
-			Protocol:          protoNumber,
-			AddressWithPrefix: tcpip.AddrFromSlice(ip.AsSlice()).WithPrefix(),
+			Protocol: protoNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.AddrFromSlice(ip.AsSlice()),
+				PrefixLen: prefix.Bits(),
+			},
 		}
 		tcpipErr := dev.stack.AddProtocolAddress(1, protoAddr, stack.AddressProperties{})
 		if tcpipErr != nil {
 			return nil, nil, fmt.Errorf("AddProtocolAddress(%v): %v", ip, tcpipErr)
 		}
-		if ip.Is4() {
-			dev.hasV4 = true
-		} else if ip.Is6() {
-			dev.hasV6 = true
-		}
 	}
+
 	if dev.hasV4 {
 		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: 1})
+
+		if config.ForwardV4 {
+			err := dev.stack.SetForwardingDefaultAndAllNICs(header.IPv4ProtocolNumber, true)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to enable forwarding for ipv4: %v", err)
+			}
+		}
 	}
+
 	if dev.hasV6 {
 		dev.stack.AddRoute(tcpip.Route{Destination: header.IPv6EmptySubnet, NIC: 1})
+
+		if config.ForwardV6 {
+			err := dev.stack.SetForwardingDefaultAndAllNICs(header.IPv6ProtocolNumber, true)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to enable forwarding for ipv6: %v", err)
+			}
+		}
+	}
+
+	if config.OptOptionsFn != nil {
+		err := config.OptStackFn(dev.stack)
+		if err != nil {
+			return nil, nil, fmt.Errorf("optional netstack object function failed: %w", err)
+		}
 	}
 
 	dev.events <- tun.EventUp
